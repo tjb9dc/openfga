@@ -47,21 +47,56 @@ func NewSQLTupleIterator(sb sq.SelectBuilder, errHandler errorHandlerFn) *SQLTup
 	}
 }
 
+type fetchResult struct {
+	rows *sql.Rows
+	err  error
+}
+
 func (t *SQLTupleIterator) fetchBuffer(ctx context.Context) error {
 	ctx, span := tracer.Start(ctx, "sqlite.fetchBuffer", trace.WithAttributes())
 	defer span.End()
-	ctx = context.WithoutCancel(ctx)
-	start := time.Now()
-	rows, err := t.sb.QueryContext(ctx)
-	elapsed := time.Since(start)
-	if err != nil {
-		storageErr := t.handleSQLError(err)
-		storage.ObserveIterQueryDuration(storage.SuccessLabel(storageErr), elapsed)
-		return storageErr
+
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	storage.ObserveIterQueryDuration(true, elapsed)
-	t.rows = rows
-	return nil
+
+	// The query runs on a context detached from cancellation so that the
+	// returned rows are not invalidated mid-consumption when the request
+	// context ends (see #2508). The wait below still honors the caller's
+	// context: without it, an exhausted connection pool blocks Next()
+	// indefinitely, and concurrent expansions that hold an open iterator
+	// while dispatching further reads can deadlock the pool permanently.
+	queryCtx := context.WithoutCancel(ctx)
+	start := time.Now()
+
+	resultChan := make(chan fetchResult, 1)
+	go func() {
+		rows, err := t.sb.QueryContext(queryCtx)
+		resultChan <- fetchResult{rows: rows, err: err}
+	}()
+
+	select {
+	case <-ctx.Done():
+		// Abandon the fetch, but return the connection it may still be
+		// granted to the pool instead of holding it forever.
+		go func() {
+			if res := <-resultChan; res.rows != nil {
+				_ = res.rows.Close()
+			}
+		}()
+		storage.ObserveIterQueryDuration(false, time.Since(start))
+		return ctx.Err()
+	case res := <-resultChan:
+		elapsed := time.Since(start)
+		if res.err != nil {
+			storageErr := t.handleSQLError(res.err)
+			storage.ObserveIterQueryDuration(storage.SuccessLabel(storageErr), elapsed)
+			return storageErr
+		}
+		storage.ObserveIterQueryDuration(true, elapsed)
+		t.rows = res.rows
+		return nil
+	}
 }
 
 func (t *SQLTupleIterator) next(ctx context.Context) (*storage.TupleRecord, error) {
